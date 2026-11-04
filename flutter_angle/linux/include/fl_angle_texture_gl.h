@@ -46,6 +46,7 @@ struct _FlutterAnglePlugin{
   GdkGLContext* context;
 
   EGLDisplay eglDisplay;
+  EGLContext eglContext = nullptr;
   EGLConfig config;
   Map *map = nullptr;
 };
