@@ -54,7 +54,8 @@ class FlutterAngleTexture {
 
   RenderingContext getContext() {
     assert(_flutterAngle._baseAppContext != nullptr, "OpenGL isn't initialized! Please call FlutterAngle.initOpenGL");
-    return RenderingContext.create(_flutterAngle._rawOpenGl, options.width, options.height);
+    // ROOSTER: each of the renderer's calls holds our context (Linux).
+    return RenderingContext.create(_flutterAngle._rawOpenGl, options.width, options.height, false, _flutterAngle._linuxGuard?.hold);
   }
 
   /// Whenever you finished your rendering you have to call this function to signal
@@ -91,7 +92,11 @@ class FlutterAngle {
   bool _isRBO = true;
   bool _disposed = false;
 
+  /// ROOSTER: Linux only; see [_LinuxGlGuard].
+  _LinuxGlGuard? _linuxGuard;
+
   LibOpenGLES get _rawOpenGl {
+    _linuxGuard?.hold();
     if (_libOpenGLES == null) {
       if (Platform.isWindows) {
         _libOpenGLES = LibOpenGLES(DynamicLibrary.open(resolveDylibPath('libGLESv2')));
@@ -161,7 +166,15 @@ class FlutterAngle {
     }
 
     /// Init OpenGL on the Dart side too
-    _display = _libEGL!.eglGetDisplay();
+    // ROOSTER: on Linux, the display the plugin made its context on: the
+    // one Flutter renders with (the same native display, the same
+    // platform), so its texture can be handed to Flutter's context. The
+    // default display is another one, and a context shared across two
+    // displays is no share at all.
+    final pluginDisplay = Platform.isLinux && result is Map ? result['display'] as int? : null;
+    _display = pluginDisplay != null && pluginDisplay != 0
+        ? Pointer<Void>.fromAddress(pluginDisplay)
+        : _libEGL!.eglGetDisplay();
     final initializeResult = _libEGL!.eglInitialize(_display);
 
     angleConsole.info('EGL version: $initializeResult');
@@ -196,15 +209,32 @@ class FlutterAngle {
     eglAttributes.clear();
     _eglConfig = chooseConfigResult[0];
 
-    _baseAppContext = _libEGL!.eglCreateContext(
-      _display, 
-      _eglConfig,
-      shareContext: _pluginContext == nullptr?null:_pluginContext,
-      contextClientVersion: 3,
-      isDebugContext: useDebugContext && !Platform.isAndroid
-    );
+    // ROOSTER: an OpenGL ES context whatever API this thread has bound
+    // (GTK binds desktop OpenGL for its windows on Linux), and GTK's API
+    // put back after.
+    final previousApi = Platform.isLinux ? _LinuxGlGuard.bindEs() : null;
+    try {
+      _baseAppContext = _libEGL!.eglCreateContext(
+        _display,
+        _eglConfig,
+        shareContext: _pluginContext == nullptr?null:_pluginContext,
+        contextClientVersion: 3,
+        isDebugContext: useDebugContext && !Platform.isAndroid
+      );
+    } finally {
+      if (previousApi != null) _LinuxGlGuard.bindApi(previousApi);
+    }
 
-    if(!_isApple){
+    if (Platform.isLinux) {
+      // ROOSTER: not made current for good here: GTK draws the window on
+      // this very thread between our frames. The guard makes it current
+      // for each GL call, and puts back what GTK had before the task ends.
+      if (_baseAppContext == nullptr) {
+        throw EglException('Could not create the renderer\'s EGL context.');
+      }
+      _linuxGuard = _LinuxGlGuard(_display, _baseAppContext);
+    }
+    else if(!_isApple){
       /// bind context to this thread. All following OpenGL calls from this thread will use this context
       _libEGL!.eglMakeCurrent(_display, _dummySurface, _dummySurface, _baseAppContext);
     
@@ -513,8 +543,12 @@ class FlutterAngle {
     }
     else if(result != null){
       final int rbo = (result['openglTexture'] as int?) ?? (result['rbo'] as int?) ?? 0;
+      // ROOSTER: the attachments are the texture's own framebuffer's: bound
+      // first (a frame leaves the default one bound), and let go after.
+      _rawOpenGl.glBindFramebuffer(GL_FRAMEBUFFER, texture.fboId);
       _initRenderbuffer(rbo);
       _resizeDepthRenderbuffer(texture.depth, width, height);
+      _rawOpenGl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
       texture.rboId = rbo;
     }
 
@@ -541,7 +575,14 @@ class FlutterAngle {
       _libEGL!.eglSwapBuffers(_display, texture.surfaceId!);
     }
     else{
-      _rawOpenGl.glFlush();
+      // ROOSTER: Flutter samples the texture from its own context on the
+      // raster thread (Linux): the frame must be done drawing by then, not
+      // only on its way to the GPU.
+      if (Platform.isLinux) {
+        _rawOpenGl.glFinish();
+      } else {
+        _rawOpenGl.glFlush();
+      }
       _rawOpenGl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
       assert(_activeFramebuffer != null, 'There is no active FlutterGL Texture to update');
     }
@@ -607,6 +648,10 @@ class FlutterAngle {
     });
     textures?.clear();
     if(_baseAppContext != nullptr){
+      // ROOSTER: let go of it first (a context current on a thread is only
+      // destroyed once it is no longer), then no more holding it.
+      _linuxGuard?.releaseNow();
+      _linuxGuard = null;
       _libEGL!.eglDestroyContext(_display, _baseAppContext);
       _baseAppContext = nullptr;
     }
@@ -645,5 +690,161 @@ class FlutterAngle {
     if (glGetError != GL_NO_ERROR) {
       angleConsole.error('$message: $glGetError');
     }
+  }
+}
+
+/// ROOSTER: on Linux, Flutter 3.41 runs the Dart UI thread on GTK's main
+/// thread, and GTK (its window's paint context) and Flutter make their own
+/// GL contexts current there between our frames. Upstream made the
+/// renderer's context current once, at init: every later GL call landed in
+/// whichever context GTK had left current. The game drew into the window's
+/// own context (the whole window flickered, half of it a frame behind, as
+/// the game's depth test and culling met GTK's quad) and nothing into its
+/// texture. Now each GL call makes ours current first, and whatever was
+/// current before goes back at the end of the task (a microtask: nothing of
+/// GTK's runs in between), so GTK finds its context where it left it.
+///
+/// On X11 GTK's contexts are GLX ones, and libglvnd refuses an EGL context
+/// while a GLX one is current on the thread (EGL_BAD_ACCESS): that one is
+/// let go first and made current again after.
+class _LinuxGlGuard {
+  _LinuxGlGuard(this.display, this.context);
+
+  final Pointer<Void> display;
+  final Pointer<Void> context;
+
+  static const int _eglDraw = 0x3059;
+  static const int _eglRead = 0x305A;
+
+  static final DynamicLibrary _lib = DynamicLibrary.open('libEGL.so.1');
+  static final Pointer<Void> Function() _currentContext = _lib.lookupFunction<
+      Pointer<Void> Function(), Pointer<Void> Function()>('eglGetCurrentContext');
+  static final Pointer<Void> Function() _currentDisplay = _lib.lookupFunction<
+      Pointer<Void> Function(), Pointer<Void> Function()>('eglGetCurrentDisplay');
+  static final Pointer<Void> Function(int) _currentSurface = _lib.lookupFunction<
+      Pointer<Void> Function(Int32), Pointer<Void> Function(int)>('eglGetCurrentSurface');
+  static final int Function(Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<Void>)
+      _makeCurrent = _lib.lookupFunction<
+          Uint32 Function(Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<Void>),
+          int Function(Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<Void>)>(
+          'eglMakeCurrent');
+
+  static const int _eglOpenGlEsApi = 0x30A0;
+  static final int Function() _queryApi =
+      _lib.lookupFunction<Uint32 Function(), int Function()>('eglQueryAPI');
+  static final int Function(int) _bindApi =
+      _lib.lookupFunction<Uint32 Function(Uint32), int Function(int)>('eglBindAPI');
+
+  /// Binds OpenGL ES on this thread; the API bound before.
+  static int bindEs() {
+    final previous = _queryApi();
+    _bindApi(_eglOpenGlEsApi);
+    return previous;
+  }
+
+  static void bindApi(int api) => _bindApi(api);
+
+  static final _Glx? _glx = _Glx.find();
+
+  bool _holding = false;
+  bool _switched = false;
+  _GlxBinding? _glxPrevious;
+  Pointer<Void> _previousDisplay = nullptr;
+  Pointer<Void> _previousDraw = nullptr;
+  Pointer<Void> _previousRead = nullptr;
+  Pointer<Void> _previous = nullptr;
+
+  /// Makes the renderer's context current until the end of this task.
+  void hold() {
+    if (_holding) return;
+    _holding = true;
+    scheduleMicrotask(releaseNow);
+    _previous = _currentContext();
+    if (_previous == context) return;
+    _previousDisplay = _currentDisplay();
+    _previousDraw = _currentSurface(_eglDraw);
+    _previousRead = _currentSurface(_eglRead);
+    _glxPrevious = _glx?.release();
+    _switched = _makeCurrent(display, nullptr, nullptr, context) == 1;
+    if (!_switched) {
+      final glxPrevious = _glxPrevious;
+      _glxPrevious = null;
+      if (glxPrevious != null) _glx!.restore(glxPrevious);
+      angleConsole.error('Could not make the renderer\'s EGL context current');
+    }
+  }
+
+  /// Puts back whatever was current before [hold].
+  void releaseNow() {
+    if (!_holding) return;
+    _holding = false;
+    if (!_switched) return;
+    _switched = false;
+    if (_previous == nullptr) {
+      _makeCurrent(display, nullptr, nullptr, nullptr);
+    } else {
+      _makeCurrent(_previousDisplay, _previousDraw, _previousRead, _previous);
+    }
+    final glxPrevious = _glxPrevious;
+    _glxPrevious = null;
+    if (glxPrevious != null) _glx!.restore(glxPrevious);
+  }
+}
+
+/// ROOSTER: a GLX context current on the thread, as it was.
+typedef _GlxBinding = ({
+  Pointer<Void> display,
+  int draw,
+  int read,
+  Pointer<Void> context,
+});
+
+/// ROOSTER: GLX, when the process has it (GTK on X11); see [_LinuxGlGuard].
+class _Glx {
+  _Glx._(DynamicLibrary lib)
+      : _currentContext = lib.lookupFunction<Pointer<Void> Function(),
+            Pointer<Void> Function()>('glXGetCurrentContext'),
+        _currentDisplay = lib.lookupFunction<Pointer<Void> Function(),
+            Pointer<Void> Function()>('glXGetCurrentDisplay'),
+        _currentDrawable = lib.lookupFunction<UnsignedLong Function(),
+            int Function()>('glXGetCurrentDrawable'),
+        _currentReadDrawable = lib.lookupFunction<UnsignedLong Function(),
+            int Function()>('glXGetCurrentReadDrawable'),
+        _makeContextCurrent = lib.lookupFunction<
+            Int32 Function(Pointer<Void>, UnsignedLong, UnsignedLong, Pointer<Void>),
+            int Function(Pointer<Void>, int, int, Pointer<Void>)>('glXMakeContextCurrent');
+
+  static _Glx? find() {
+    final process = DynamicLibrary.process();
+    if (process.providesSymbol('glXGetCurrentContext') &&
+        process.providesSymbol('glXMakeContextCurrent')) {
+      return _Glx._(process);
+    }
+    return null;
+  }
+
+  final Pointer<Void> Function() _currentContext;
+  final Pointer<Void> Function() _currentDisplay;
+  final int Function() _currentDrawable;
+  final int Function() _currentReadDrawable;
+  final int Function(Pointer<Void>, int, int, Pointer<Void>) _makeContextCurrent;
+
+  /// Lets go of the current GLX context, if any; what it was.
+  _GlxBinding? release() {
+    final context = _currentContext();
+    if (context == nullptr) return null;
+    final binding = (
+      display: _currentDisplay(),
+      draw: _currentDrawable(),
+      read: _currentReadDrawable(),
+      context: context,
+    );
+    _makeContextCurrent(binding.display, 0, 0, nullptr);
+    return binding;
+  }
+
+  void restore(_GlxBinding binding) {
+    _makeContextCurrent(
+        binding.display, binding.draw, binding.read, binding.context);
   }
 }
