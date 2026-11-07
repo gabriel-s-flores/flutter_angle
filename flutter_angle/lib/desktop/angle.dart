@@ -572,13 +572,20 @@ class FlutterAngle {
 
     // If we have an iOS EGL surface created from IOSurface, use it
     if (_useSurface && texture.surfaceId != nullptr) {
+      // ROOSTER: a pbuffer's swap does not wait for the GPU, and the D3D
+      // texture Flutter reads is shared without a keyed mutex. The frame
+      // must be done drawing before Flutter is told it is there, or the
+      // compositor samples it mid-draw and the surface flickers.
+      if (Platform.isWindows) {
+        _rawOpenGl.glFinish();
+      }
       _libEGL!.eglSwapBuffers(_display, texture.surfaceId!);
     }
     else{
       // ROOSTER: Flutter samples the texture from its own context on the
       // raster thread (Linux): the frame must be done drawing by then, not
       // only on its way to the GPU.
-      if (Platform.isLinux) {
+      if (Platform.isLinux || Platform.isWindows) {
         _rawOpenGl.glFinish();
       } else {
         _rawOpenGl.glFlush();
