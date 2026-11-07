@@ -17,8 +17,33 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <gdk/gdkwayland.h>
+#include <gdk/gdkx.h>
 
 G_DEFINE_TYPE(FlutterAnglePlugin, flutter_angle_plugin, g_object_get_type())
+
+// ROOSTER: the EGL display Flutter's engine renders with. It asks for it this
+// same way (fl_opengl_manager.cc), and EGL hands out the same display for the
+// same platform and native display: an EGLImage of our texture made on it can
+// be bound in Flutter's context.
+static EGLDisplay flutter_display() {
+  auto get_platform_display = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
+      eglGetProcAddress("eglGetPlatformDisplayEXT"));
+  GdkDisplay* display = gdk_display_get_default();
+  if (get_platform_display != nullptr && display != nullptr) {
+    if (GDK_IS_WAYLAND_DISPLAY(display)) {
+      return get_platform_display(EGL_PLATFORM_WAYLAND_EXT,
+                                  gdk_wayland_display_get_wl_display(display),
+                                  nullptr);
+    }
+    if (GDK_IS_X11_DISPLAY(display)) {
+      return get_platform_display(EGL_PLATFORM_X11_EXT,
+                                  gdk_x11_display_get_xdisplay(display),
+                                  nullptr);
+    }
+  }
+  return eglGetDisplay(EGL_DEFAULT_DISPLAY);
+}
 
 // Called when a method call is received from Flutter.
 static void flutter_angle_plugin_handle_method_call(FlutterAnglePlugin *self, FlMethodCall *method_call){
@@ -31,79 +56,75 @@ static void flutter_angle_plugin_handle_method_call(FlutterAnglePlugin *self, Fl
 		response = get_platform_version();
 	} 
   else if (strcmp(method, "initOpenGL") == 0){
-    g_autoptr(GError) error = nullptr;
-    self->window = gtk_widget_get_parent_window(GTK_WIDGET(self->fl_view));
-    printf(".... initOpenGL\n");
-    
-    self->context = gdk_window_create_gl_context(self->window, &error);
-    gdk_gl_context_realize(self->context, &error);
+    // ROOSTER: one context for the plugin's textures, made once, on the
+    // display Flutter renders with (see flutter_display). Upstream shared
+    // with whatever context happened to be current on this thread (GTK's,
+    // or none), on another display: the texture never reached Flutter, and
+    // each call made another context and dropped the textures it knew.
+    if (self->eglContext == EGL_NO_CONTEXT) {
+      self->eglDisplay = flutter_display();
+      if (self->eglDisplay == EGL_NO_DISPLAY ||
+          !eglInitialize(self->eglDisplay, nullptr, nullptr)) {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "EGL InitError", "No EGL display", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
 
-    // 1. Intercept Flutter's active ambient display client and context
-    self->eglDisplay = eglGetCurrentDisplay();
-    EGLContext flutterEglContext = eglGetCurrentContext();
-    
-    if (self->eglDisplay == EGL_NO_DISPLAY || flutterEglContext == EGL_NO_CONTEXT) {
-      std::cerr << "[AnglePlugin] Failed to intercept ambient GDK EGL pointers." << std::endl;
-      self->eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-      eglInitialize(self->eglDisplay, nullptr, nullptr);
-    }
-
-    // 2. 💡 THE DEPTH/STENCIL FIX: Query Flutter's Native Visual ID instead of Config ID.
-    // This ensures compatibility with Flutter's GTK window, but allows custom bit allocation.
-    EGLint nativeVisualId = 0;
-    eglQueryContext(self->eglDisplay, flutterEglContext, EGL_NATIVE_VISUAL_ID, &nativeVisualId);
-
-    // Define your exact 3D rendering requirements
-    const EGLint attribute_list[] = {
-      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-      EGL_RED_SIZE, 8,
-      EGL_GREEN_SIZE, 8,
-      EGL_BLUE_SIZE, 8,
-      EGL_ALPHA_SIZE, 8,
-      EGL_DEPTH_SIZE, 24,    // Explicit 24-bit Depth buffer for ThreeJS
-      EGL_STENCIL_SIZE, 8,   // Explicit 8-bit Stencil buffer for complex rendering
-      EGL_NATIVE_VISUAL_ID, nativeVisualId, // Locks alignment with Flutter's GTK window
-      EGL_NONE
-    };
-
-    EGLint num_config;
-    if (!eglChooseConfig(self->eglDisplay, attribute_list, &self->config, 1, &num_config) || num_config < 1) {
-      std::cerr << "[AnglePlugin] Failed to match visual configuration with depth. Trying fallback configuration..." << std::endl;
-      // Fallback: Drop to 16-bit depth if the graphics card limits 24-bit allocations
-      const EGLint fallback_list[] = {
+      const EGLint attribute_list[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_DEPTH_SIZE, 16,
-        EGL_NATIVE_VISUAL_ID, nativeVisualId,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 24,
+        EGL_STENCIL_SIZE, 8,
         EGL_NONE
       };
-      eglChooseConfig(self->eglDisplay, fallback_list, &self->config, 1, &num_config);
+      EGLint num_config = 0;
+      if (!eglChooseConfig(self->eglDisplay, attribute_list, &self->config, 1, &num_config) || num_config < 1) {
+        const EGLint fallback_list[] = {
+          EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+          EGL_DEPTH_SIZE, 16,
+          EGL_NONE
+        };
+        eglChooseConfig(self->eglDisplay, fallback_list, &self->config, 1, &num_config);
+      }
+      if (num_config < 1) {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "EGL InitError", "No EGL config for OpenGL ES 3", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+
+      // The API is this thread's, and GTK's: GTK makes its windows' GL
+      // contexts with desktop OpenGL bound. Put back what it was.
+      const EGLenum previous_api = eglQueryAPI();
+      eglBindAPI(EGL_OPENGL_ES_API);
+      const EGLint contextAttributes[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        EGL_NONE
+      };
+      self->eglContext = eglCreateContext(self->eglDisplay, self->config, EGL_NO_CONTEXT, contextAttributes);
+      eglBindAPI(previous_api);
+      if (self->eglContext == EGL_NO_CONTEXT) {
+        g_autofree gchar* message = g_strdup_printf("Could not create a context (EGL error 0x%x)", eglGetError());
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "EGL InitError", message, nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+      self->map = new Map();
     }
 
     EGLint actualConfigId = 0;
     eglGetConfigAttrib(self->eglDisplay, self->config, EGL_CONFIG_ID, &actualConfigId);
 
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    const EGLint contextAttributes[] = { 
-      EGL_CONTEXT_CLIENT_VERSION, 3, 
-      EGL_NONE 
-    };
-
-    // 3. Create your shared rendering context safely with a valid depth mask attached
-    self->eglContext = eglCreateContext( 
-      self->eglDisplay, 
-      self->config, 
-      flutterEglContext, // Safely shares asset maps with Flutter
-      contextAttributes 
-    );
-
-    std::cerr << "[AnglePlugin] Depth/Stencil Context sharing locked under config ID: " << actualConfigId << std::endl;
-
     g_autoptr(FlValue) value = fl_value_new_map();
     fl_value_set_string_take(value, "context", fl_value_new_int((int64_t)self->eglContext));
+    fl_value_set_string_take(value, "display", fl_value_new_int((int64_t)self->eglDisplay));
     fl_value_set_string_take(value, "eglConfigId", fl_value_new_int((int64_t)actualConfigId));
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(value));
-    self->map = new Map();
   }
 	else if (strcmp(method, "createTexture") == 0){
     std::cerr << "EGL createTexture" << std::endl;
@@ -185,8 +206,10 @@ static void flutter_angle_plugin_handle_method_call(FlutterAnglePlugin *self, Fl
     }
 
     self->map->renderers[textureId]->changeSize(width,height);
-    
-    g_autoptr(FlValue) result = fl_value_new_null();
+
+    // ROOSTER: the same texture, resized: the Dart side attaches it again
+    // and resizes its depth buffer with it.
+    g_autoptr(FlValue) result = self->map->renderers[textureId]->createTexture();
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
 	}
 	else if (strcmp(method, "deleteTexture") == 0){

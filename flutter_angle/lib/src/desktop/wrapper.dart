@@ -13,12 +13,20 @@ import '../../shared/webgl.dart';
 import '../../shared/classes.dart';
 
 class RenderingContext {
-  final LibOpenGLES gl;
+  // ROOSTER: every call reaches the bindings through [gl], which first lets
+  // [beforeCall] make the renderer's context current (Linux; see
+  // _LinuxGlGuard in desktop/angle.dart).
+  final LibOpenGLES _gl;
+  final void Function()? beforeCall;
+  LibOpenGLES get gl {
+    beforeCall?.call();
+    return _gl;
+  }
   final int width;
   final int height;
   final bool checkGlErrorOnEveryCall;
 
-  RenderingContext.create(this.gl, this.width, this.height, [this.checkGlErrorOnEveryCall = false]);
+  RenderingContext.create(LibOpenGLES gl, this.width, this.height, [this.checkGlErrorOnEveryCall = false, this.beforeCall]) : _gl = gl;
 
   /// As allocating and freeing native memory is expensive and we need regularly
   /// buffers to receive values from FFI function we create a small set here that will
